@@ -43,7 +43,7 @@ enum class Algorithm {
 // greedy branch      -> Algorithm::GREEDY
 // eeco branch        -> Algorithm::EECO
 // pmapper branch     -> Algorithm::PMAPPER
-static constexpr Algorithm kSelectedAlgorithm = Algorithm::PMAPPER;
+static constexpr Algorithm kSelectedAlgorithm = Algorithm::ROUND_ROBIN;
 
 struct VMRecord {
     VMId_t vm_id;
