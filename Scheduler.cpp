@@ -60,6 +60,7 @@ unordered_map<TaskId_t, MachineId_t> g_task_to_machine;
 unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> g_machine_sla_counts;
 unordered_map<MachineId_t, unsigned> g_machine_penalty;
 unordered_set<MachineId_t> g_waking_machines;
+unordered_set<MachineId_t> g_sleeping_machines;
 deque<TaskId_t> g_pending_tasks;
 unordered_set<TaskId_t> g_pending_set;
 array<unsigned, 4> g_rr_cursor = {0, 0, 0, 0};
@@ -299,6 +300,9 @@ MachineId_t ChooseRoundRobinMachine(const TaskInfo_t &task) {
     for (size_t offset = 0; offset < g_all_machines.size(); ++offset) {
         const size_t idx = (g_rr_cursor[cpu_index] + offset) % g_all_machines.size();
         const MachineId_t machine_id = g_all_machines[idx];
+        if (g_sleeping_machines.count(machine_id)) {
+            continue;
+        }
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
         if (!IsAttachableState(machine.s_state)) {
             continue;
@@ -324,6 +328,9 @@ MachineId_t ChooseScoredAwakeMachine(const TaskInfo_t &task) {
     MachineId_t best_machine = InvalidMachine();
 
     for (MachineId_t machine_id : g_all_machines) {
+        if (g_sleeping_machines.count(machine_id)) {
+            continue;
+        }
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
         if (!IsAttachableState(machine.s_state)) {
             continue;
@@ -409,6 +416,10 @@ bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
     VMId_t vm_id = FindReusableVM(machine_id, task.required_vm, task.required_cpu);
 
     if (vm_id == InvalidVM()) {
+        const MachineInfo_t recheck = Machine_GetInfo(machine_id);
+        if (!IsAttachableState(recheck.s_state)) {
+            return false;
+        }
         vm_id = VM_Create(task.required_vm, task.required_cpu);
         VM_Attach(vm_id, machine_id);
         g_vm_records[vm_id] = VMRecord{vm_id, machine_id, task.required_vm, task.required_cpu};
@@ -539,6 +550,7 @@ void ManageIdleMachines() {
         }
 
         if (idle_attachable_by_cpu[cpu_index] > warm_target) {
+            g_sleeping_machines.insert(machine_id);
             Machine_SetState(machine_id, S3);
             idle_attachable_by_cpu[cpu_index]--;
         } else if (machine.s_state != S0i1) {
@@ -556,6 +568,7 @@ void ResetState() {
     g_machine_sla_counts.clear();
     g_machine_penalty.clear();
     g_waking_machines.clear();
+    g_sleeping_machines.clear();
     g_pending_tasks.clear();
     g_pending_set.clear();
     g_rr_cursor = {0, 0, 0, 0};
@@ -579,6 +592,7 @@ void Scheduler::Init() {
 
         if ((kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::MBFD) &&
             i >= 2 && machine.s_state == S0) {
+            g_sleeping_machines.insert(machine_id);
             Machine_SetState(machine_id, S3);
         }
     }
@@ -693,5 +707,6 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     (void)time;
     g_waking_machines.erase(machine_id);
+    g_sleeping_machines.erase(machine_id);
     DispatchPendingTasks();
 }
