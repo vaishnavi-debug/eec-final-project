@@ -510,6 +510,16 @@ void DropEmptyVM(VMId_t vm_id) {
     }
 
     const MachineId_t machine_id = record_it->second.machine_id;
+    const MachineInfo_t machine = Machine_GetInfo(machine_id);
+
+    // VM_Shutdown internally calls DetachVM, which the framework rejects unless the
+    // machine is fully active (S0). In any other state leave the VM in place as a
+    // hot-spare so it can be reused; ManageIdleMachines will clean it up before the
+    // machine sleeps to S3.
+    if (machine.s_state != S0) {
+        return;
+    }
+
     VM_Shutdown(vm_id);
     g_vm_records.erase(record_it);
 
@@ -582,10 +592,37 @@ void ManageIdleMachines() {
             continue;
         }
 
+        // The framework may report active_vms==0 for a machine that still has an
+        // empty (task-free) VM attached.  Check our own records to be safe.
+        const auto vm_track_it = g_machine_to_vms.find(machine_id);
+        const bool has_tracked_vms = (vm_track_it != g_machine_to_vms.end() &&
+                                      !vm_track_it->second.empty());
+
         if (idle_attachable_by_cpu[cpu_index] > warm_target) {
-            g_sleeping_machines.insert(machine_id);
-            Machine_SetState(machine_id, S3);
-            idle_attachable_by_cpu[cpu_index]--;
+            // Before sleeping the machine to S3, shut down any lingering empty VMs
+            // (only possible while the machine is still in S0).
+            if (has_tracked_vms && machine.s_state == S0) {
+                vector<VMId_t> to_remove;
+                for (VMId_t vid : vm_track_it->second) {
+                    const VMInfo_t vinfo = VM_GetInfo(vid);
+                    if (vinfo.active_tasks.empty()) {
+                        VM_Shutdown(vid);
+                        g_vm_records.erase(vid);
+                        to_remove.push_back(vid);
+                    }
+                }
+                for (VMId_t vid : to_remove) {
+                    vm_track_it->second.erase(
+                        remove(vm_track_it->second.begin(), vm_track_it->second.end(), vid),
+                        vm_track_it->second.end());
+                }
+            }
+            // Only sleep the machine once it is truly VM-free.
+            if (!has_tracked_vms || vm_track_it->second.empty()) {
+                g_sleeping_machines.insert(machine_id);
+                Machine_SetState(machine_id, S3);
+                idle_attachable_by_cpu[cpu_index]--;
+            }
         } else if (machine.s_state != S0i1) {
             Machine_SetState(machine_id, S0i1);
         }
@@ -656,7 +693,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
 void Scheduler::Shutdown(Time_t time) {
     (void)time;
     for (const auto &entry : g_vm_records) {
-        VM_Shutdown(entry.first);
+        const MachineInfo_t machine = Machine_GetInfo(entry.second.machine_id);
+        if (machine.s_state == S0) {
+            VM_Shutdown(entry.first);
+        }
     }
     SimOutput("SimulationComplete(): algorithm=" + string(AlgorithmName()), 1);
 }
