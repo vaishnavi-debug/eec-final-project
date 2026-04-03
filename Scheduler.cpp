@@ -626,8 +626,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     const MachineId_t machine_id = task_machine_it->second;
     const TaskInfo_t task = GetTaskInfo(task_id);
 
-    // The framework may have already removed the task from the VM's active list
-    // by the time it calls TaskComplete, so guard before removing.
     const VMInfo_t vm_before = VM_GetInfo(vm_id);
     bool task_in_vm = false;
     for (const TaskId_t t : vm_before.active_tasks) {
