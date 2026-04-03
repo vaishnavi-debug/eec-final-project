@@ -35,15 +35,15 @@ enum class Algorithm {
     ROUND_ROBIN,
     GREEDY,
     EECO,
-    MBFD
+    PMAPPER
 };
 
 // Change this line per branch:
 // round-robin branch -> Algorithm::ROUND_ROBIN
 // greedy branch      -> Algorithm::GREEDY
 // eeco branch        -> Algorithm::EECO
-// mbfd branch        -> Algorithm::MBFD
-static constexpr Algorithm kSelectedAlgorithm = Algorithm::MBFD;
+// pmapper branch     -> Algorithm::PMAPPER
+static constexpr Algorithm kSelectedAlgorithm = Algorithm::PMAPPER;
 
 struct VMRecord {
     VMId_t vm_id;
@@ -70,7 +70,7 @@ const char *AlgorithmName() {
         case Algorithm::ROUND_ROBIN: return "round_robin";
         case Algorithm::GREEDY: return "greedy";
         case Algorithm::EECO: return "eeco";
-        case Algorithm::MBFD: return "mbfd";
+        case Algorithm::PMAPPER: return "pmapper";
     }
     return "unknown";
 }
@@ -142,12 +142,12 @@ double MaxLoadForTask(const TaskInfo_t &task) {
                 case SLA3: return 1.60;
             }
             break;
-        case Algorithm::MBFD:
+        case Algorithm::PMAPPER:
             switch (task.required_sla) {
-                case SLA0: return 0.75;
-                case SLA1: return 0.95;
-                case SLA2: return 1.20;
-                case SLA3: return 1.50;
+                case SLA0: return 0.80;
+                case SLA1: return 1.00;
+                case SLA2: return 1.25;
+                case SLA3: return 1.55;
             }
             break;
     }
@@ -167,7 +167,7 @@ double MaxMemoryFractionForTask(const TaskInfo_t &task) {
                 default: return 0.94;
             }
         case Algorithm::EECO:
-        case Algorithm::MBFD:
+        case Algorithm::PMAPPER:
             switch (task.required_sla) {
                 case SLA0: return 0.75;
                 case SLA1: return 0.85;
@@ -264,22 +264,35 @@ double EecoScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reus
     return score;
 }
 
-double MBFDScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reuses_vm) {
-    const double base_power = (machine.s_states.empty() ? 0.0 : machine.s_states[S0]) +
-                              (machine.p_states.empty() ? 0.0 : machine.p_states[machine.p_state] * machine.num_cpus);
+// PMapper: power-aware placement using a linear power model with strong consolidation.
+// Assigns tasks to servers that minimize power increase while maximising utilization,
+// reducing the number of active servers (Best Fit Decreasing on power).
+double PMapperScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reuses_vm) {
+    const double p_idle = machine.s_states.empty() ? 0.0 : machine.s_states[S0];
+    const double p_cpu  = machine.p_states.empty() ? 0.0 : machine.p_states[P0];
 
-    const double current_load = SafeDiv(static_cast<double>(machine.active_tasks), static_cast<double>(machine.num_cpus));
-    const double next_load = SafeDiv(static_cast<double>(machine.active_tasks + 1), static_cast<double>(machine.num_cpus));
-    const double dynamic_now = base_power * (0.35 + 0.65 * current_load);
-    const double dynamic_next = base_power * (0.35 + 0.65 * next_load);
-    const double delta_power = dynamic_next - dynamic_now;
+    // Linear power model: P(u) = P_idle + P_dyn_max * u
+    const double p_dyn_max = p_cpu * machine.num_cpus;
+    const double u_current = SafeDiv(static_cast<double>(machine.active_tasks),     static_cast<double>(machine.num_cpus));
+    const double u_next    = SafeDiv(static_cast<double>(machine.active_tasks + 1), static_cast<double>(machine.num_cpus));
+    const double delta_power = p_dyn_max * (u_next - u_current);
 
-    const double deadline_bias = (task.required_sla == SLA0) ? -10.0 : (task.required_sla == SLA1 ? -4.0 : 0.0);
+    // Consolidation: strongly prefer already-loaded machines to minimise active server count.
+    const double remaining_capacity = 1.0 - u_current;
+    const double consolidation = remaining_capacity * 45.0;
+
     const double memory_fraction = SafeDiv(static_cast<double>(machine.memory_used), static_cast<double>(machine.memory_size));
 
-    double score = delta_power + memory_fraction * 20.0 + 12.0 * g_machine_penalty[machine.machine_id] + deadline_bias;
+    // SLA-aware bias: high-SLA tasks prefer responsive (less loaded) machines slightly.
+    const double sla_bias = (task.required_sla == SLA0) ? -8.0 : (task.required_sla == SLA1 ? -3.0 : 0.0);
+
+    // Perf-per-watt bonus: favour energy-efficient machines.
+    const double efficiency = (p_idle + p_dyn_max > 0.0) ? (p_dyn_max / (p_idle + p_dyn_max)) : 0.0;
+
+    double score = delta_power + consolidation + memory_fraction * 18.0 + sla_bias - efficiency * 3.0;
+    score += 12.0 * g_machine_penalty[machine.machine_id];
     if (reuses_vm) {
-        score -= 8.0;
+        score -= 10.0;
     }
     return score;
 }
@@ -290,8 +303,8 @@ double ScoreMachine(const MachineInfo_t &machine, const TaskInfo_t &task, bool r
             return GreedyScore(machine, reuses_vm);
         case Algorithm::EECO:
             return EecoScore(machine, task, reuses_vm);
-        case Algorithm::MBFD:
-            return MBFDScore(machine, task, reuses_vm);
+        case Algorithm::PMAPPER:
+            return PMapperScore(machine, task, reuses_vm);
         case Algorithm::ROUND_ROBIN:
         default:
             return 0.0;
@@ -527,7 +540,7 @@ void TuneMachinePower(MachineId_t machine_id) {
     } else if (load_fraction > 0.35) {
         target = (kSelectedAlgorithm == Algorithm::GREEDY) ? P1 : P2;
     } else {
-        target = (kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::MBFD) ? P3 : P2;
+        target = (kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::PMAPPER) ? P3 : P2;
     }
 
     SetMachinePerformance(machine_id, target);
@@ -538,7 +551,7 @@ unsigned WarmIdleTarget() {
         case Algorithm::ROUND_ROBIN: return 1000;
         case Algorithm::GREEDY: return 0;
         case Algorithm::EECO: return 1;
-        case Algorithm::MBFD: return 1;
+        case Algorithm::PMAPPER: return 1;
     }
     return 1;
 }
@@ -610,7 +623,7 @@ void Scheduler::Init() {
         g_all_machines.push_back(machine_id);
         g_machine_sla_counts[machine_id] = {0, 0, 0, 0};
 
-        if ((kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::MBFD) &&
+        if ((kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::PMAPPER) &&
             i >= 2 && machine.s_state == S0) {
             g_sleeping_machines.insert(machine_id);
             Machine_SetState(machine_id, S3);
