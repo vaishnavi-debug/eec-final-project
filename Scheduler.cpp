@@ -626,16 +626,7 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     const MachineId_t machine_id = task_machine_it->second;
     const TaskInfo_t task = GetTaskInfo(task_id);
 
-    // The framework may have already removed the task from the VM's active list
-    // by the time it calls TaskComplete, so guard before removing.
-    const VMInfo_t vm_before = VM_GetInfo(vm_id);
-    bool task_in_vm = false;
-    for (const TaskId_t t : vm_before.active_tasks) {
-        if (t == task_id) { task_in_vm = true; break; }
-    }
-    if (task_in_vm) {
-        VM_RemoveTask(vm_id, task_id);
-    }
+    VM_RemoveTask(vm_id, task_id);
 
     auto machine_sla_it = g_machine_sla_counts.find(machine_id);
     if (machine_sla_it != g_machine_sla_counts.end() && machine_sla_it->second[task.required_sla] > 0) {
@@ -645,8 +636,8 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     g_task_to_vm.erase(task_vm_it);
     g_task_to_machine.erase(task_machine_it);
 
-    const VMInfo_t vm_after = VM_GetInfo(vm_id);
-    if (vm_after.active_tasks.empty()) {
+    const VMInfo_t vm = VM_GetInfo(vm_id);
+    if (vm.active_tasks.empty()) {
         DropEmptyVM(vm_id);
     }
 }
