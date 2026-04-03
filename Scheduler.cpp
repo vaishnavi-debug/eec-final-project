@@ -592,33 +592,27 @@ void ManageIdleMachines() {
             continue;
         }
 
-        // The framework may report active_vms==0 for a machine that still has an
-        // empty (task-free) VM attached.  Check our own records to be safe.
+        // The framework zeros active_tasks/active_vms when a task's time expires,
+        // *before* our TaskComplete callback fires.  g_machine_sla_counts is only
+        // decremented inside TaskComplete, so a non-zero entry means at least one
+        // task completion is still pending — skip the machine entirely to avoid
+        // racing with that callback (DetachVM / AttachVM both crash in sleep mode).
+        const auto sla_it = g_machine_sla_counts.find(machine_id);
+        if (sla_it != g_machine_sla_counts.end()) {
+            const auto &c = sla_it->second;
+            if (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0) {
+                continue;
+            }
+        }
+
+        // Also skip if our own VM tracking still has VMs on this machine (hot-spare
+        // VMs that DropEmptyVM left because the machine was in S0i1 at the time).
         const auto vm_track_it = g_machine_to_vms.find(machine_id);
         const bool has_tracked_vms = (vm_track_it != g_machine_to_vms.end() &&
                                       !vm_track_it->second.empty());
 
         if (idle_attachable_by_cpu[cpu_index] > warm_target) {
-            // Before sleeping the machine to S3, shut down any lingering empty VMs
-            // (only possible while the machine is still in S0).
-            if (has_tracked_vms && machine.s_state == S0) {
-                vector<VMId_t> to_remove;
-                for (VMId_t vid : vm_track_it->second) {
-                    const VMInfo_t vinfo = VM_GetInfo(vid);
-                    if (vinfo.active_tasks.empty()) {
-                        VM_Shutdown(vid);
-                        g_vm_records.erase(vid);
-                        to_remove.push_back(vid);
-                    }
-                }
-                for (VMId_t vid : to_remove) {
-                    vm_track_it->second.erase(
-                        remove(vm_track_it->second.begin(), vm_track_it->second.end(), vid),
-                        vm_track_it->second.end());
-                }
-            }
-            // Only sleep the machine once it is truly VM-free.
-            if (!has_tracked_vms || vm_track_it->second.empty()) {
+            if (!has_tracked_vms) {
                 g_sleeping_machines.insert(machine_id);
                 Machine_SetState(machine_id, S3);
                 idle_attachable_by_cpu[cpu_index]--;
