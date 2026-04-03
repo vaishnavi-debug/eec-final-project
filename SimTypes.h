@@ -8,6 +8,7 @@
 #ifndef SimTypes_h
 #define SimTypes_h
 
+#include <cstdint>
 #include <iostream>
 #include <vector>
 
