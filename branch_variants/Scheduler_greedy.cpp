@@ -477,10 +477,27 @@ bool TryAssignTask(TaskId_t task_id, bool allow_wake) {
     }
 
     if (allow_wake) {
-        machine_id = ChooseSleepingMachine(task);
-        if (machine_id != InvalidMachine()) {
-            g_waking_machines.insert(machine_id);
-            Machine_SetState(machine_id, S0);
+        if (task.required_sla == SLA0) {
+            // For SLA0 tasks wake EVERY suitable sleeping machine at once so
+            // all cores become available as soon as possible.
+            for (MachineId_t mid : g_all_machines) {
+                if (g_waking_machines.count(mid)) continue;
+                if (!g_sleeping_machines.count(mid)) {
+                    const MachineInfo_t m = Machine_GetInfo(mid);
+                    if (m.s_state == S0 || m.s_state == S0i1) continue;
+                }
+                const MachineInfo_t m = Machine_GetInfo(mid);
+                if (!SupportsTask(m, task)) continue;
+                g_waking_machines.insert(mid);
+                g_sleeping_machines.erase(mid);
+                Machine_SetState(mid, S0);
+            }
+        } else {
+            machine_id = ChooseSleepingMachine(task);
+            if (machine_id != InvalidMachine()) {
+                g_waking_machines.insert(machine_id);
+                Machine_SetState(machine_id, S0);
+            }
         }
     }
 
@@ -586,6 +603,20 @@ void ManageIdleMachines() {
         return;
     }
 
+    // Don't sleep or idle-step any machine while SLA0 tasks are in the system
+    // (either pending or currently running). Sleeping machines during a high-
+    // priority burst causes wakeup latency that directly drives SLA violations.
+    for (TaskId_t tid : g_pending_tasks) {
+        if (!IsTaskCompleted(tid) && GetTaskInfo(tid).required_sla == SLA0) {
+            return;
+        }
+    }
+    for (const auto &entry : g_machine_sla_counts) {
+        if (entry.second[SLA0] > 0) {
+            return;
+        }
+    }
+
     array<unsigned, 4> idle_attachable_by_cpu = {0, 0, 0, 0};
     for (MachineId_t machine_id : g_all_machines) {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
@@ -670,7 +701,7 @@ void Scheduler::Init() {
         g_machine_sla_counts[machine_id] = {0, 0, 0, 0};
 
         if ((kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::PMAPPER) &&
-            i >= 2 && machine.s_state == S0) {
+            i >= 4 && machine.s_state == S0) {
             g_sleeping_machines.insert(machine_id);
             Machine_SetState(machine_id, S3);
         }
