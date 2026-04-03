@@ -60,6 +60,7 @@ unordered_map<TaskId_t, MachineId_t> g_task_to_machine;
 unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> g_machine_sla_counts;
 unordered_map<MachineId_t, unsigned> g_machine_penalty;
 unordered_set<MachineId_t> g_waking_machines;
+unordered_set<MachineId_t> g_sleeping_machines;
 deque<TaskId_t> g_pending_tasks;
 unordered_set<TaskId_t> g_pending_set;
 array<unsigned, 4> g_rr_cursor = {0, 0, 0, 0};
@@ -299,6 +300,9 @@ MachineId_t ChooseRoundRobinMachine(const TaskInfo_t &task) {
     for (size_t offset = 0; offset < g_all_machines.size(); ++offset) {
         const size_t idx = (g_rr_cursor[cpu_index] + offset) % g_all_machines.size();
         const MachineId_t machine_id = g_all_machines[idx];
+        if (g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
+            continue;
+        }
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
         if (!IsAttachableState(machine.s_state)) {
             continue;
@@ -324,6 +328,9 @@ MachineId_t ChooseScoredAwakeMachine(const TaskInfo_t &task) {
     MachineId_t best_machine = InvalidMachine();
 
     for (MachineId_t machine_id : g_all_machines) {
+        if (g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
+            continue;
+        }
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
         if (!IsAttachableState(machine.s_state)) {
             continue;
@@ -353,7 +360,7 @@ MachineId_t ChooseSleepingMachine(const TaskInfo_t &task) {
 
     for (MachineId_t machine_id : g_all_machines) {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
-        if (IsAttachableState(machine.s_state) || g_waking_machines.count(machine_id) != 0) {
+        if (IsAttachableState(machine.s_state) || g_waking_machines.count(machine_id) != 0 || g_sleeping_machines.count(machine_id) != 0) {
             continue;
         }
         if (!SupportsTask(machine, task)) {
@@ -409,6 +416,11 @@ bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
     VMId_t vm_id = FindReusableVM(machine_id, task.required_vm, task.required_cpu);
 
     if (vm_id == InvalidVM()) {
+        const MachineInfo_t recheck = Machine_GetInfo(machine_id);
+        if (!IsAttachableState(recheck.s_state) ||
+            g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
+            return false;
+        }
         vm_id = VM_Create(task.required_vm, task.required_cpu);
         VM_Attach(vm_id, machine_id);
         g_vm_records[vm_id] = VMRecord{vm_id, machine_id, task.required_vm, task.required_cpu};
@@ -531,7 +543,7 @@ void ManageIdleMachines() {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
         const size_t cpu_index = CPUIndex(machine.cpu);
 
-        if (machine.active_tasks != 0 || machine.active_vms != 0 || g_waking_machines.count(machine_id) != 0) {
+        if (machine.active_tasks != 0 || machine.active_vms != 0 || g_waking_machines.count(machine_id) != 0 || g_sleeping_machines.count(machine_id) != 0) {
             continue;
         }
         if (!IsAttachableState(machine.s_state)) {
@@ -539,6 +551,7 @@ void ManageIdleMachines() {
         }
 
         if (idle_attachable_by_cpu[cpu_index] > warm_target) {
+            g_sleeping_machines.insert(machine_id);
             Machine_SetState(machine_id, S3);
             idle_attachable_by_cpu[cpu_index]--;
         } else if (machine.s_state != S0i1) {
@@ -556,6 +569,7 @@ void ResetState() {
     g_machine_sla_counts.clear();
     g_machine_penalty.clear();
     g_waking_machines.clear();
+    g_sleeping_machines.clear();
     g_pending_tasks.clear();
     g_pending_set.clear();
     g_rr_cursor = {0, 0, 0, 0};
@@ -626,6 +640,8 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     const MachineId_t machine_id = task_machine_it->second;
     const TaskInfo_t task = GetTaskInfo(task_id);
 
+    // The framework may have already removed the task from the VM's active list
+    // by the time it calls TaskComplete, so guard before removing.
     const VMInfo_t vm_before = VM_GetInfo(vm_id);
     bool task_in_vm = false;
     for (const TaskId_t t : vm_before.active_tasks) {
@@ -700,5 +716,6 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     (void)time;
     g_waking_machines.erase(machine_id);
+    g_sleeping_machines.erase(machine_id);
     DispatchPendingTasks();
 }
