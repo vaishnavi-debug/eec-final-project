@@ -136,8 +136,8 @@ double MaxLoadForTask(const TaskInfo_t &task) {
             break;
         case Algorithm::EECO:
             switch (task.required_sla) {
-                case SLA0: return 0.70;
-                case SLA1: return 0.95;
+                case SLA0: return 0.90;
+                case SLA1: return 1.00;
                 case SLA2: return 1.25;
                 case SLA3: return 1.60;
             }
@@ -488,6 +488,17 @@ bool TryAssignTask(TaskId_t task_id, bool allow_wake) {
 }
 
 void DispatchPendingTasks() {
+    if (g_pending_tasks.empty()) {
+        return;
+    }
+
+    // Sort by SLA urgency (SLA0 first) so the highest-priority tasks get
+    // machines before lower-priority ones when capacity is limited.
+    sort(g_pending_tasks.begin(), g_pending_tasks.end(),
+         [](TaskId_t a, TaskId_t b) {
+             return GetTaskInfo(a).required_sla < GetTaskInfo(b).required_sla;
+         });
+
     const size_t pending = g_pending_tasks.size();
     for (size_t i = 0; i < pending; ++i) {
         const TaskId_t task_id = g_pending_tasks.front();
@@ -497,7 +508,11 @@ void DispatchPendingTasks() {
         if (IsTaskCompleted(task_id)) {
             continue;
         }
-        if (!TryAssignTask(task_id, false)) {
+        // Allow SLA0 pending tasks to wake sleeping machines — the standard
+        // path (NewTask) only wakes one machine per arrival, which is too slow
+        // for sudden high-priority bursts.
+        const bool allow_wake = (GetTaskInfo(task_id).required_sla == SLA0);
+        if (!TryAssignTask(task_id, allow_wake)) {
             QueueTask(task_id);
         }
     }
