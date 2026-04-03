@@ -5,11 +5,10 @@ CXXFLAGS = -Wall -std=c++17
 # Include directories
 INCLUDES = -I.
 
-# Source files
-SRC = Init.cpp Machine.cpp main.cpp Scheduler.cpp Simulator.cpp Task.cpp VM.cpp
+# Only Scheduler.cpp is student-written; the rest are pre-compiled framework objects
+SCHEDULER_OBJ = Scheduler.o
 
-# Object files
-OBJ = $(SRC:.cpp=.o)
+FRAMEWORK_OBJ = Init.o Machine.o main.o Simulator.o Task.o VM.o
 
 # Executable
 TARGET = simulator
@@ -17,18 +16,16 @@ TARGET = simulator
 # Default target
 all: $(TARGET)
 
-# Default target
-scheduler: $(OBJ)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o scheduler $(OBJ)
+$(TARGET): $(SCHEDULER_OBJ) $(FRAMEWORK_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(TARGET) $(SCHEDULER_OBJ) $(FRAMEWORK_OBJ)
 
-# Build target
-$(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(TARGET) $(OBJ)
+scheduler: $(SCHEDULER_OBJ) $(FRAMEWORK_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o scheduler $(SCHEDULER_OBJ) $(FRAMEWORK_OBJ)
 
-# Compile source files into object files
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+# Compile only the student-written scheduler
+$(SCHEDULER_OBJ): Scheduler.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c Scheduler.cpp -o $(SCHEDULER_OBJ)
 
-# Clean up build files
+# Only clean student-built files; framework .o files must stay
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(SCHEDULER_OBJ) $(TARGET) scheduler
