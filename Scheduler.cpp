@@ -79,8 +79,15 @@ size_t CPUIndex(CPUType_t cpu) {
     return static_cast<size_t>(cpu);
 }
 
+// Machine is "up" – existing VMs can accept VM_AddTask in either state.
 bool IsAttachableState(MachineState_t state) {
     return state == S0 || state == S0i1;
+}
+
+// VM_Attach (creating a brand-new VM) requires the machine to be fully active (S0 only).
+// S0i1 is treated as sleep mode by the framework for attachment purposes.
+bool CanAttachNewVM(MachineState_t state) {
+    return state == S0;
 }
 
 double SafeDiv(double num, double den) {
@@ -312,6 +319,9 @@ MachineId_t ChooseRoundRobinMachine(const TaskInfo_t &task) {
         }
 
         const bool needs_new_vm = (FindReusableVM(machine_id, task.required_vm, task.required_cpu) == InvalidVM());
+        if (needs_new_vm && !CanAttachNewVM(machine.s_state)) {
+            continue;
+        }
         if (!HasCapacity(machine, task, needs_new_vm)) {
             continue;
         }
@@ -340,6 +350,9 @@ MachineId_t ChooseScoredAwakeMachine(const TaskInfo_t &task) {
         }
 
         const bool reuses_vm = (FindReusableVM(machine_id, task.required_vm, task.required_cpu) != InvalidVM());
+        if (!reuses_vm && !CanAttachNewVM(machine.s_state)) {
+            continue;
+        }
         if (!HasCapacity(machine, task, !reuses_vm)) {
             continue;
         }
@@ -360,8 +373,12 @@ MachineId_t ChooseSleepingMachine(const TaskInfo_t &task) {
 
     for (MachineId_t machine_id : g_all_machines) {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
-        if (IsAttachableState(machine.s_state) || g_waking_machines.count(machine_id) != 0 ||
-            g_sleeping_machines.count(machine_id) != 0) {
+        if (g_waking_machines.count(machine_id) != 0 || g_sleeping_machines.count(machine_id) != 0) {
+            continue;
+        }
+        // Skip S0 machines (already fully active and handled by ChooseScoredAwakeMachine).
+        // Include S0i1 machines — they need waking to S0 before a new VM can be attached.
+        if (machine.s_state == S0) {
             continue;
         }
         if (!SupportsTask(machine, task)) {
@@ -418,7 +435,7 @@ bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
 
     if (vm_id == InvalidVM()) {
         const MachineInfo_t recheck = Machine_GetInfo(machine_id);
-        if (!IsAttachableState(recheck.s_state) ||
+        if (!CanAttachNewVM(recheck.s_state) ||
             g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
             return false;
         }
