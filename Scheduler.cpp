@@ -373,12 +373,8 @@ MachineId_t ChooseSleepingMachine(const TaskInfo_t &task) {
 
     for (MachineId_t machine_id : g_all_machines) {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
-        if (g_waking_machines.count(machine_id) != 0 || g_sleeping_machines.count(machine_id) != 0) {
-            continue;
-        }
-        // Skip S0 machines (already fully active and handled by ChooseScoredAwakeMachine).
-        // Include S0i1 machines — they need waking to S0 before a new VM can be attached.
-        if (machine.s_state == S0) {
+        if (IsAttachableState(machine.s_state) ||
+            g_waking_machines.count(machine_id) != 0 || g_sleeping_machines.count(machine_id) != 0) {
             continue;
         }
         if (!SupportsTask(machine, task)) {
