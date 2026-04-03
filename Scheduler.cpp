@@ -300,7 +300,7 @@ MachineId_t ChooseRoundRobinMachine(const TaskInfo_t &task) {
     for (size_t offset = 0; offset < g_all_machines.size(); ++offset) {
         const size_t idx = (g_rr_cursor[cpu_index] + offset) % g_all_machines.size();
         const MachineId_t machine_id = g_all_machines[idx];
-        if (g_sleeping_machines.count(machine_id)) {
+        if (g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
             continue;
         }
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
@@ -328,7 +328,7 @@ MachineId_t ChooseScoredAwakeMachine(const TaskInfo_t &task) {
     MachineId_t best_machine = InvalidMachine();
 
     for (MachineId_t machine_id : g_all_machines) {
-        if (g_sleeping_machines.count(machine_id)) {
+        if (g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
             continue;
         }
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
@@ -360,7 +360,8 @@ MachineId_t ChooseSleepingMachine(const TaskInfo_t &task) {
 
     for (MachineId_t machine_id : g_all_machines) {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
-        if (IsAttachableState(machine.s_state) || g_waking_machines.count(machine_id) != 0) {
+        if (IsAttachableState(machine.s_state) || g_waking_machines.count(machine_id) != 0 ||
+            g_sleeping_machines.count(machine_id) != 0) {
             continue;
         }
         if (!SupportsTask(machine, task)) {
@@ -417,7 +418,8 @@ bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
 
     if (vm_id == InvalidVM()) {
         const MachineInfo_t recheck = Machine_GetInfo(machine_id);
-        if (!IsAttachableState(recheck.s_state)) {
+        if (!IsAttachableState(recheck.s_state) ||
+            g_sleeping_machines.count(machine_id) || g_waking_machines.count(machine_id)) {
             return false;
         }
         vm_id = VM_Create(task.required_vm, task.required_cpu);
@@ -542,7 +544,8 @@ void ManageIdleMachines() {
         const MachineInfo_t machine = Machine_GetInfo(machine_id);
         const size_t cpu_index = CPUIndex(machine.cpu);
 
-        if (machine.active_tasks != 0 || machine.active_vms != 0 || g_waking_machines.count(machine_id) != 0) {
+        if (machine.active_tasks != 0 || machine.active_vms != 0 ||
+            g_waking_machines.count(machine_id) != 0 || g_sleeping_machines.count(machine_id) != 0) {
             continue;
         }
         if (!IsAttachableState(machine.s_state)) {
