@@ -592,6 +592,7 @@ void Scheduler::Init() {
 
         if ((kSelectedAlgorithm == Algorithm::EECO || kSelectedAlgorithm == Algorithm::MBFD) &&
             i >= 2 && machine.s_state == S0) {
+            g_sleeping_machines.insert(machine_id);
             Machine_SetState(machine_id, S3);
         }
     }
