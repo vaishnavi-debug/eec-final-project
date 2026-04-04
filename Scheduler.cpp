@@ -484,7 +484,7 @@ bool TryAssignTask(TaskId_t task_id, bool allow_wake) {
                 if (g_waking_machines.count(mid)) continue;
                 if (!g_sleeping_machines.count(mid)) {
                     const MachineInfo_t m = Machine_GetInfo(mid);
-                    if (m.s_state == S0) continue;  // already fully active
+                    if (m.s_state == S0 || m.s_state == S0i1) continue;
                 }
                 const MachineInfo_t m = Machine_GetInfo(mid);
                 if (!SupportsTask(m, task)) continue;
