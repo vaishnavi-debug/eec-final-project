@@ -264,9 +264,11 @@ double EecoScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reus
     return score;
 }
 
-// PMapper: power-aware placement using a linear power model with strong consolidation.
-// Assigns tasks to servers that minimize power increase while maximising utilization,
-// reducing the number of active servers (Best Fit Decreasing on power).
+// PMapper: power-aware placement using a linear power model with moderate consolidation.
+// For SLA0 tasks consolidation is disabled so high-priority work spreads across all
+// available cores immediately. For other SLAs a lighter consolidation weight (12) is
+// used — enough to reduce active-server count without forcing so many wakeup cycles
+// that long-running tests (e.g. Day) become excessively slow.
 double PMapperScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reuses_vm) {
     const double p_idle = machine.s_states.empty() ? 0.0 : machine.s_states[S0];
     const double p_cpu  = machine.p_states.empty() ? 0.0 : machine.p_states[P0];
@@ -277,14 +279,17 @@ double PMapperScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool r
     const double u_next    = SafeDiv(static_cast<double>(machine.active_tasks + 1), static_cast<double>(machine.num_cpus));
     const double delta_power = p_dyn_max * (u_next - u_current);
 
-    // Consolidation: strongly prefer already-loaded machines to minimise active server count.
+    // Consolidation: disabled for SLA0 (spread load instantly across all cores);
+    // moderate weight for other SLAs to reduce active-server count without
+    // causing a wakeup-cycle storm on lightly-loaded workloads.
     const double remaining_capacity = 1.0 - u_current;
-    const double consolidation = remaining_capacity * 45.0;
+    const double consolidation_weight = (task.required_sla == SLA0) ? 0.0 : 12.0;
+    const double consolidation = remaining_capacity * consolidation_weight;
 
     const double memory_fraction = SafeDiv(static_cast<double>(machine.memory_used), static_cast<double>(machine.memory_size));
 
-    // SLA-aware bias: high-SLA tasks prefer responsive (less loaded) machines slightly.
-    const double sla_bias = (task.required_sla == SLA0) ? -8.0 : (task.required_sla == SLA1 ? -3.0 : 0.0);
+    // SLA bias: SLA0 prefers machines with headroom; others are neutral.
+    const double sla_bias = (task.required_sla == SLA0) ? -6.0 : (task.required_sla == SLA1 ? -2.0 : 0.0);
 
     // Perf-per-watt bonus: favour energy-efficient machines.
     const double efficiency = (p_idle + p_dyn_max > 0.0) ? (p_dyn_max / (p_idle + p_dyn_max)) : 0.0;
