@@ -463,15 +463,9 @@ bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
     return true;
 }
 
-// high_priority=true pushes to front so SLA0 tasks are dispatched first
-// without requiring an O(N log N) sort on every dispatch cycle.
-void QueueTask(TaskId_t task_id, bool high_priority = false) {
+void QueueTask(TaskId_t task_id) {
     if (g_pending_set.insert(task_id).second) {
-        if (high_priority) {
-            g_pending_tasks.push_front(task_id);
-        } else {
-            g_pending_tasks.push_back(task_id);
-        }
+        g_pending_tasks.push_back(task_id);
     }
 }
 
@@ -484,15 +478,13 @@ bool TryAssignTask(TaskId_t task_id, bool allow_wake) {
 
     if (allow_wake) {
         if (task.required_sla == SLA0) {
-            // For SLA0 tasks wake EVERY suitable non-S0 machine at once so all
-            // cores become available as quickly as possible.  S0i1 machines are
-            // included: the original exclusion meant they were silently skipped
-            // during bursts, leaving the warm machine idle while cores sat unused.
+            // For SLA0 tasks wake EVERY suitable sleeping machine at once so
+            // all cores become available as soon as possible.
             for (MachineId_t mid : g_all_machines) {
                 if (g_waking_machines.count(mid)) continue;
                 if (!g_sleeping_machines.count(mid)) {
                     const MachineInfo_t m = Machine_GetInfo(mid);
-                    if (m.s_state == S0) continue;  // already fully active
+                    if (m.s_state == S0 || m.s_state == S0i1) continue;
                 }
                 const MachineInfo_t m = Machine_GetInfo(mid);
                 if (!SupportsTask(m, task)) continue;
@@ -517,13 +509,13 @@ void DispatchPendingTasks() {
         return;
     }
 
-    // Process exactly the tasks that were pending when we entered.
-    // allow_wake=true for every task so that queued non-SLA0 tasks (SLA1/SLA2/SLA3)
-    // can also unblock themselves by waking a sleeping machine — without this,
-    // any non-SLA0 task that ends up in the queue when no awake machine exists
-    // will never escape (DispatchPendingTasks would re-queue it indefinitely).
-    // Priority ordering is maintained by QueueTask push_front for SLA0; no
-    // O(N log N * GetTaskInfo) sort is needed or performed here.
+    // Sort by SLA urgency (SLA0 first) so the highest-priority tasks get
+    // machines before lower-priority ones when capacity is limited.
+    sort(g_pending_tasks.begin(), g_pending_tasks.end(),
+         [](TaskId_t a, TaskId_t b) {
+             return GetTaskInfo(a).required_sla < GetTaskInfo(b).required_sla;
+         });
+
     const size_t pending = g_pending_tasks.size();
     for (size_t i = 0; i < pending; ++i) {
         const TaskId_t task_id = g_pending_tasks.front();
@@ -533,7 +525,11 @@ void DispatchPendingTasks() {
         if (IsTaskCompleted(task_id)) {
             continue;
         }
-        if (!TryAssignTask(task_id, true)) {
+        // Allow SLA0 pending tasks to wake sleeping machines — the standard
+        // path (NewTask) only wakes one machine per arrival, which is too slow
+        // for sudden high-priority bursts.
+        const bool allow_wake = (GetTaskInfo(task_id).required_sla == SLA0);
+        if (!TryAssignTask(task_id, allow_wake)) {
             QueueTask(task_id);
         }
     }
@@ -667,8 +663,8 @@ void ManageIdleMachines() {
                 Machine_SetState(machine_id, S3);
                 idle_attachable_by_cpu[cpu_index]--;
             }
-        } else {
-            // Warm machine: keep in S0 for immediate VM attachment.
+        } else if (machine.s_state != S0i1) {
+            Machine_SetState(machine_id, S0i1);
         }
     }
 }
@@ -720,8 +716,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     (void)now;
     if (!TryAssignTask(task_id, true)) {
-        const bool high_pri = (GetTaskInfo(task_id).required_sla == SLA0);
-        QueueTask(task_id, high_pri);
+        QueueTask(task_id);
     }
 }
 
