@@ -130,7 +130,7 @@ double MaxLoadForTask(const TaskInfo_t &task) {
             break;
         case Algorithm::GREEDY:
             switch (task.required_sla) {
-                case SLA0: return 0.85;
+                case SLA0: return 0.90;
                 case SLA1: return 1.00;
                 case SLA2: return 1.30;
                 case SLA3: return 1.70;
@@ -802,6 +802,13 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     const VMInfo_t vm_after = VM_GetInfo(vm_id);
     if (vm_after.active_tasks.empty()) {
         DropEmptyVM(vm_id);
+    }
+    // Dispatch pending tasks immediately when a slot frees up, rather than
+    // waiting for the next PeriodicCheck. Critical for GREEDY (WarmIdleTarget=0):
+    // without a warm machine no StateChangeComplete wakeup events are generated,
+    // so queued tasks would stall between completions until the next periodic tick.
+    if (!g_pending_tasks.empty()) {
+        DispatchPendingTasks();
     }
 }
 
