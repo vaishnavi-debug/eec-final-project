@@ -64,6 +64,8 @@ unordered_set<MachineId_t> g_sleeping_machines;
 deque<TaskId_t> g_pending_tasks;
 unordered_set<TaskId_t> g_pending_set;
 array<unsigned, 4> g_rr_cursor = {0, 0, 0, 0};
+int g_active_sla0_count = 0;
+int g_pending_sla0_count = 0;
 
 const char *AlgorithmName() {
     switch (kSelectedAlgorithm) {
@@ -445,6 +447,9 @@ void TrackAssignment(MachineId_t machine_id, VMId_t vm_id, const TaskInfo_t &tas
     g_task_to_vm[task.task_id] = vm_id;
     g_task_to_machine[task.task_id] = machine_id;
     g_machine_sla_counts[machine_id][task.required_sla]++;
+    if (task.required_sla == SLA0) {
+        g_active_sla0_count++;
+    }
 }
 
 bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
@@ -474,6 +479,7 @@ void QueueTask(TaskId_t task_id, bool high_priority = false) {
     if (g_pending_set.insert(task_id).second) {
         if (high_priority) {
             g_pending_tasks.push_front(task_id);
+            g_pending_sla0_count++;
         } else {
             g_pending_tasks.push_back(task_id);
         }
@@ -536,10 +542,23 @@ void DispatchPendingTasks() {
         g_pending_set.erase(task_id);
 
         if (IsTaskCompleted(task_id)) {
+            if (g_pending_sla0_count > 0) {
+                const TaskInfo_t t = GetTaskInfo(task_id);
+                if (t.required_sla == SLA0) {
+                    g_pending_sla0_count--;
+                }
+            }
             continue;
         }
+
+        const TaskInfo_t t = GetTaskInfo(task_id);
+        const bool is_sla0 = (t.required_sla == SLA0);
+        if (is_sla0 && g_pending_sla0_count > 0) {
+            g_pending_sla0_count--;
+        }
+
         if (!TryAssignTask(task_id, true)) {
-            QueueTask(task_id);
+            QueueTask(task_id, is_sla0);
         }
     }
 }
@@ -613,17 +632,10 @@ void ManageIdleMachines() {
     }
 
     // Don't sleep or idle-step any machine while SLA0 tasks are in the system
-    // (either pending or currently running). Sleeping machines during a high-
-    // priority burst causes wakeup latency that directly drives SLA violations.
-    for (TaskId_t tid : g_pending_tasks) {
-        if (!IsTaskCompleted(tid) && GetTaskInfo(tid).required_sla == SLA0) {
-            return;
-        }
-    }
-    for (const auto &entry : g_machine_sla_counts) {
-        if (entry.second[SLA0] > 0) {
-            return;
-        }
+    // (either pending or currently running). O(1) counters avoid iterating the
+    // full pending queue and all machines on every PeriodicCheck call.
+    if (g_active_sla0_count > 0 || g_pending_sla0_count > 0) {
+        return;
     }
 
     array<unsigned, 4> idle_attachable_by_cpu = {0, 0, 0, 0};
@@ -691,6 +703,8 @@ void ResetState() {
     g_pending_tasks.clear();
     g_pending_set.clear();
     g_rr_cursor = {0, 0, 0, 0};
+    g_active_sla0_count = 0;
+    g_pending_sla0_count = 0;
 }
 
 }  // namespace
@@ -778,6 +792,9 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     if (machine_sla_it != g_machine_sla_counts.end() && machine_sla_it->second[task.required_sla] > 0) {
         machine_sla_it->second[task.required_sla]--;
     }
+    if (task.required_sla == SLA0 && g_active_sla0_count > 0) {
+        g_active_sla0_count--;
+    }
 
     g_task_to_vm.erase(task_vm_it);
     g_task_to_machine.erase(task_machine_it);
@@ -838,7 +855,16 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     (void)time;
+    // Only dispatch when a machine finishes waking up (S3/S0i1 → S0).
+    // Transitions triggered by ManageIdleMachines (S0 → S0i1, S0 → S3) also
+    // fire this callback, but dispatching there is wasteful — no new capacity
+    // has become available. Skipping those calls eliminates O(N_pending)
+    // iterations on every idle-to-sleep transition (the dominant bottleneck
+    // for long workloads like "Day" and "Gentler Hour").
+    const bool was_waking = g_waking_machines.count(machine_id) > 0;
     g_waking_machines.erase(machine_id);
     g_sleeping_machines.erase(machine_id);
-    DispatchPendingTasks();
+    if (was_waking) {
+        DispatchPendingTasks();
+    }
 }
