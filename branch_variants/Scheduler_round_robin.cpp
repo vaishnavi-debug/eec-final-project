@@ -64,8 +64,6 @@ unordered_set<MachineId_t> g_sleeping_machines;
 deque<TaskId_t> g_pending_tasks;
 unordered_set<TaskId_t> g_pending_set;
 array<unsigned, 4> g_rr_cursor = {0, 0, 0, 0};
-int g_active_sla0_count = 0;
-int g_pending_sla0_count = 0;
 
 const char *AlgorithmName() {
     switch (kSelectedAlgorithm) {
@@ -266,11 +264,9 @@ double EecoScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reus
     return score;
 }
 
-// PMapper: power-aware placement using a linear power model with moderate consolidation.
-// For SLA0 tasks consolidation is disabled so high-priority work spreads across all
-// available cores immediately. For other SLAs a lighter consolidation weight (12) is
-// used — enough to reduce active-server count without forcing so many wakeup cycles
-// that long-running tests (e.g. Day) become excessively slow.
+// PMapper: power-aware placement using a linear power model with strong consolidation.
+// Assigns tasks to servers that minimize power increase while maximising utilization,
+// reducing the number of active servers (Best Fit Decreasing on power).
 double PMapperScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool reuses_vm) {
     const double p_idle = machine.s_states.empty() ? 0.0 : machine.s_states[S0];
     const double p_cpu  = machine.p_states.empty() ? 0.0 : machine.p_states[P0];
@@ -281,17 +277,14 @@ double PMapperScore(const MachineInfo_t &machine, const TaskInfo_t &task, bool r
     const double u_next    = SafeDiv(static_cast<double>(machine.active_tasks + 1), static_cast<double>(machine.num_cpus));
     const double delta_power = p_dyn_max * (u_next - u_current);
 
-    // Consolidation: disabled for SLA0 (spread load instantly across all cores);
-    // moderate weight for other SLAs to reduce active-server count without
-    // causing a wakeup-cycle storm on lightly-loaded workloads.
+    // Consolidation: strongly prefer already-loaded machines to minimise active server count.
     const double remaining_capacity = 1.0 - u_current;
-    const double consolidation_weight = (task.required_sla == SLA0) ? 0.0 : 12.0;
-    const double consolidation = remaining_capacity * consolidation_weight;
+    const double consolidation = remaining_capacity * 45.0;
 
     const double memory_fraction = SafeDiv(static_cast<double>(machine.memory_used), static_cast<double>(machine.memory_size));
 
-    // SLA bias: SLA0 prefers machines with headroom; others are neutral.
-    const double sla_bias = (task.required_sla == SLA0) ? -6.0 : (task.required_sla == SLA1 ? -2.0 : 0.0);
+    // SLA-aware bias: high-SLA tasks prefer responsive (less loaded) machines slightly.
+    const double sla_bias = (task.required_sla == SLA0) ? -8.0 : (task.required_sla == SLA1 ? -3.0 : 0.0);
 
     // Perf-per-watt bonus: favour energy-efficient machines.
     const double efficiency = (p_idle + p_dyn_max > 0.0) ? (p_dyn_max / (p_idle + p_dyn_max)) : 0.0;
@@ -447,9 +440,6 @@ void TrackAssignment(MachineId_t machine_id, VMId_t vm_id, const TaskInfo_t &tas
     g_task_to_vm[task.task_id] = vm_id;
     g_task_to_machine[task.task_id] = machine_id;
     g_machine_sla_counts[machine_id][task.required_sla]++;
-    if (task.required_sla == SLA0) {
-        g_active_sla0_count++;
-    }
 }
 
 bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
@@ -473,16 +463,9 @@ bool AssignToMachine(MachineId_t machine_id, TaskId_t task_id) {
     return true;
 }
 
-// high_priority=true pushes to front so SLA0 tasks are dispatched first
-// without requiring an O(N log N) sort on every dispatch cycle.
-void QueueTask(TaskId_t task_id, bool high_priority = false) {
+void QueueTask(TaskId_t task_id) {
     if (g_pending_set.insert(task_id).second) {
-        if (high_priority) {
-            g_pending_tasks.push_front(task_id);
-            g_pending_sla0_count++;
-        } else {
-            g_pending_tasks.push_back(task_id);
-        }
+        g_pending_tasks.push_back(task_id);
     }
 }
 
@@ -495,15 +478,13 @@ bool TryAssignTask(TaskId_t task_id, bool allow_wake) {
 
     if (allow_wake) {
         if (task.required_sla == SLA0) {
-            // For SLA0 tasks wake EVERY suitable non-S0 machine at once so all
-            // cores become available as quickly as possible.  S0i1 machines are
-            // included: the original exclusion meant they were silently skipped
-            // during bursts, leaving the warm machine idle while cores sat unused.
+            // For SLA0 tasks wake EVERY suitable sleeping machine at once so
+            // all cores become available as soon as possible.
             for (MachineId_t mid : g_all_machines) {
                 if (g_waking_machines.count(mid)) continue;
                 if (!g_sleeping_machines.count(mid)) {
                     const MachineInfo_t m = Machine_GetInfo(mid);
-                    if (m.s_state == S0) continue;  // already fully active
+                    if (m.s_state == S0 || m.s_state == S0i1) continue;
                 }
                 const MachineInfo_t m = Machine_GetInfo(mid);
                 if (!SupportsTask(m, task)) continue;
@@ -528,13 +509,13 @@ void DispatchPendingTasks() {
         return;
     }
 
-    // Process exactly the tasks that were pending when we entered.
-    // allow_wake=true for every task so that queued non-SLA0 tasks (SLA1/SLA2/SLA3)
-    // can also unblock themselves by waking a sleeping machine — without this,
-    // any non-SLA0 task that ends up in the queue when no awake machine exists
-    // will never escape (DispatchPendingTasks would re-queue it indefinitely).
-    // Priority ordering is maintained by QueueTask push_front for SLA0; no
-    // O(N log N * GetTaskInfo) sort is needed or performed here.
+    // Sort by SLA urgency (SLA0 first) so the highest-priority tasks get
+    // machines before lower-priority ones when capacity is limited.
+    sort(g_pending_tasks.begin(), g_pending_tasks.end(),
+         [](TaskId_t a, TaskId_t b) {
+             return GetTaskInfo(a).required_sla < GetTaskInfo(b).required_sla;
+         });
+
     const size_t pending = g_pending_tasks.size();
     for (size_t i = 0; i < pending; ++i) {
         const TaskId_t task_id = g_pending_tasks.front();
@@ -542,23 +523,14 @@ void DispatchPendingTasks() {
         g_pending_set.erase(task_id);
 
         if (IsTaskCompleted(task_id)) {
-            if (g_pending_sla0_count > 0) {
-                const TaskInfo_t t = GetTaskInfo(task_id);
-                if (t.required_sla == SLA0) {
-                    g_pending_sla0_count--;
-                }
-            }
             continue;
         }
-
-        const TaskInfo_t t = GetTaskInfo(task_id);
-        const bool is_sla0 = (t.required_sla == SLA0);
-        if (is_sla0 && g_pending_sla0_count > 0) {
-            g_pending_sla0_count--;
-        }
-
-        if (!TryAssignTask(task_id, true)) {
-            QueueTask(task_id, is_sla0);
+        // Allow SLA0 pending tasks to wake sleeping machines — the standard
+        // path (NewTask) only wakes one machine per arrival, which is too slow
+        // for sudden high-priority bursts.
+        const bool allow_wake = (GetTaskInfo(task_id).required_sla == SLA0);
+        if (!TryAssignTask(task_id, allow_wake)) {
+            QueueTask(task_id);
         }
     }
 }
@@ -632,10 +604,17 @@ void ManageIdleMachines() {
     }
 
     // Don't sleep or idle-step any machine while SLA0 tasks are in the system
-    // (either pending or currently running). O(1) counters avoid iterating the
-    // full pending queue and all machines on every PeriodicCheck call.
-    if (g_active_sla0_count > 0 || g_pending_sla0_count > 0) {
-        return;
+    // (either pending or currently running). Sleeping machines during a high-
+    // priority burst causes wakeup latency that directly drives SLA violations.
+    for (TaskId_t tid : g_pending_tasks) {
+        if (!IsTaskCompleted(tid) && GetTaskInfo(tid).required_sla == SLA0) {
+            return;
+        }
+    }
+    for (const auto &entry : g_machine_sla_counts) {
+        if (entry.second[SLA0] > 0) {
+            return;
+        }
     }
 
     array<unsigned, 4> idle_attachable_by_cpu = {0, 0, 0, 0};
@@ -703,8 +682,6 @@ void ResetState() {
     g_pending_tasks.clear();
     g_pending_set.clear();
     g_rr_cursor = {0, 0, 0, 0};
-    g_active_sla0_count = 0;
-    g_pending_sla0_count = 0;
 }
 
 }  // namespace
@@ -739,8 +716,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     (void)now;
     if (!TryAssignTask(task_id, true)) {
-        const bool high_pri = (GetTaskInfo(task_id).required_sla == SLA0);
-        QueueTask(task_id, high_pri);
+        QueueTask(task_id);
     }
 }
 
@@ -791,9 +767,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     auto machine_sla_it = g_machine_sla_counts.find(machine_id);
     if (machine_sla_it != g_machine_sla_counts.end() && machine_sla_it->second[task.required_sla] > 0) {
         machine_sla_it->second[task.required_sla]--;
-    }
-    if (task.required_sla == SLA0 && g_active_sla0_count > 0) {
-        g_active_sla0_count--;
     }
 
     g_task_to_vm.erase(task_vm_it);
@@ -855,16 +828,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     (void)time;
-    // Only dispatch when a machine finishes waking up (S3/S0i1 → S0).
-    // Transitions triggered by ManageIdleMachines (S0 → S0i1, S0 → S3) also
-    // fire this callback, but dispatching there is wasteful — no new capacity
-    // has become available. Skipping those calls eliminates O(N_pending)
-    // iterations on every idle-to-sleep transition (the dominant bottleneck
-    // for long workloads like "Day" and "Gentler Hour").
-    const bool was_waking = g_waking_machines.count(machine_id) > 0;
     g_waking_machines.erase(machine_id);
     g_sleeping_machines.erase(machine_id);
-    if (was_waking) {
-        DispatchPendingTasks();
-    }
+    DispatchPendingTasks();
 }
