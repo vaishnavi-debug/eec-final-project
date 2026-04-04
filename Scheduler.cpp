@@ -663,8 +663,10 @@ void ManageIdleMachines() {
                 Machine_SetState(machine_id, S3);
                 idle_attachable_by_cpu[cpu_index]--;
             }
-        } else if (machine.s_state != S0i1) {
-            Machine_SetState(machine_id, S0i1);
+        } else {
+            // Warm machine: keep in S0 for immediate VM attachment.
+            // CanAttachNewVM(S0i1)=false forces a wakeup round-trip even for
+            // the "warm" machine — eliminated by staying in S0.
         }
     }
 }
