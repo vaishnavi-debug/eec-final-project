@@ -484,13 +484,15 @@ bool TryAssignTask(TaskId_t task_id, bool allow_wake) {
 
     if (allow_wake) {
         if (task.required_sla == SLA0) {
-            // For SLA0 tasks wake EVERY suitable sleeping machine at once so
-            // all cores become available as soon as possible.
+            // For SLA0 tasks wake EVERY suitable non-S0 machine at once so all
+            // cores become available as quickly as possible.  S0i1 machines are
+            // included: the original exclusion meant they were silently skipped
+            // during bursts, leaving the warm machine idle while cores sat unused.
             for (MachineId_t mid : g_all_machines) {
                 if (g_waking_machines.count(mid)) continue;
                 if (!g_sleeping_machines.count(mid)) {
                     const MachineInfo_t m = Machine_GetInfo(mid);
-                    if (m.s_state == S0 || m.s_state == S0i1) continue;
+                    if (m.s_state == S0) continue;  // already fully active
                 }
                 const MachineInfo_t m = Machine_GetInfo(mid);
                 if (!SupportsTask(m, task)) continue;
@@ -665,8 +667,8 @@ void ManageIdleMachines() {
                 Machine_SetState(machine_id, S3);
                 idle_attachable_by_cpu[cpu_index]--;
             }
-        } else if (machine.s_state != S0i1) {
-            Machine_SetState(machine_id, S0i1);
+        } else {
+            // Warm machine: keep in S0 for immediate VM attachment.
         }
     }
 }
